@@ -5,7 +5,7 @@
 # 用法（主机执行到已运行容器）:
 #   docker exec -it <container> bash -lc 'cd /app && chmod +x docker/replace.sh && ./docker/replace.sh'
 # 连接到容器终端
-#   curl -s https://example.com/script.sh | bash
+#   curl -s https://raw.githubusercontent.com/OnlineMo/Goofish-Auto-reply-replace/refs/heads/main/replace.sh | bash
 
 set -euo pipefail
 
