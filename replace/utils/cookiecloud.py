@@ -2,18 +2,28 @@
 """
 CookieCloud 同步工具
 
-从 CookieCloud 服务拉取并解析 Cookie，返回可直接用于请求头/WS 的 cookies 字符串。
-优先调用 /get/:uuid?password=xxx 返回明文；若返回 {encrypted} 则仅记录警告（未包含密码的服务端不解密）。
+支持两种返回：
+1) 明文：POST /get/:uuid 携带 body {password}，返回 { cookie_data, local_storage_data }
+2) 加密：返回 { encrypted: "...(base64 of Salted__ + salt + ciphertext)..." } 时，使用
+   OpenSSL EVP_BytesToKey(MD5) 派生 (key, iv) 并 AES-256-CBC 解密，密码为 md5(f"{uuid}-{password}")[:16]
+
+输出：可直接用于请求头/WS 的 cookies 字符串 ("k1=v1; k2=v2")
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 from typing import Dict, List, Optional, Any, Tuple
 
 from loguru import logger
 import aiohttp
+
+# cryptography 用于 AES-CBC 解密与 PKCS7 去填充
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # type: ignore
+from cryptography.hazmat.backends import default_backend  # type: ignore
 
 
 __all__ = ["fetch_cookiecloud_cookie_str", "build_cookie_str_from_cookie_data"]
@@ -104,9 +114,94 @@ def build_cookie_str_from_cookie_data(cookie_data: Dict[str, List[dict]], prefer
     return "; ".join([f"{k}={v}" for k, v in kv.items()])
 
 
+def _pkcs7_unpad(data: bytes, block_size: int = 16) -> bytes:
+    if not data:
+        raise ValueError("pkcs7: empty data")
+    pad_len = data[-1]
+    if pad_len <= 0 or pad_len > block_size:
+        raise ValueError("pkcs7: invalid padding length")
+    if data[-pad_len:] != bytes([pad_len]) * pad_len:
+        raise ValueError("pkcs7: invalid padding bytes")
+    return data[:-pad_len]
+
+
+def _evp_bytes_to_key(password: bytes, salt: bytes, key_len: int = 32, iv_len: int = 16) -> Tuple[bytes, bytes]:
+    """
+    OpenSSL EVP_BytesToKey（MD5）实现，与 CryptoJS.AES(passphrase) 默认一致。
+    返回 (key, iv)
+    """
+    if salt and len(salt) != 8:
+        raise ValueError(f"salt length is {len(salt)}, expected 8")
+
+    d = b""
+    last = b""
+    while len(d) < (key_len + iv_len):
+        md5 = hashlib.md5()
+        md5.update(last + password + (salt or b""))
+        last = md5.digest()
+        d += last
+    return d[:key_len], d[key_len:key_len + iv_len]
+
+
+def _decrypt_cryptojs_encrypted(encrypted_b64: str, passphrase: str) -> bytes:
+    """
+    解密 CryptoJS.AES.encrypt(msg, passphrase) 生成的密文（OpenSSL 兼容，带 "Salted__" 头）。
+    """
+    raw = base64.b64decode(encrypted_b64)
+    if len(raw) < 16 or raw[:8] != b"Salted__":
+        raise ValueError("invalid ciphertext header (missing 'Salted__')")
+
+    salt = raw[8:16]
+    ciphertext = raw[16:]
+
+    key, iv = _evp_bytes_to_key(passphrase.encode("utf-8"), salt, key_len=32, iv_len=16)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(ciphertext) + decryptor.finalize()
+    return _pkcs7_unpad(padded, block_size=16)
+
+
+async def _post_try_plain(session: aiohttp.ClientSession, url: str, password: str) -> Optional[dict]:
+    """
+    用 POST 方式提交 password 尝试让服务端直接返回明文。
+    先以 x-www-form-urlencoded 提交，不行再 JSON。
+    返回解析后的 JSON 对象或 None。
+    """
+    # 1) application/x-www-form-urlencoded
+    try:
+        async with session.post(url, data={"password": password}) as resp:
+            text = await resp.text()
+            if resp.status == 200:
+                try:
+                    return json.loads(text)
+                except Exception:
+                    logger.debug("CookieCloud POST form 返回非 JSON，尝试 JSON 提交")
+            else:
+                logger.debug(f"CookieCloud POST form 失败: HTTP {resp.status}, {text[:200]}")
+    except Exception as e:
+        logger.debug(f"CookieCloud POST form 异常: {e}")
+
+    # 2) application/json
+    try:
+        async with session.post(url, json={"password": password}) as resp:
+            text = await resp.text()
+            if resp.status == 200:
+                try:
+                    return json.loads(text)
+                except Exception:
+                    logger.debug("CookieCloud POST json 返回非 JSON")
+            else:
+                logger.debug(f"CookieCloud POST json 失败: HTTP {resp.status}, {text[:200]}")
+    except Exception as e:
+        logger.debug(f"CookieCloud POST json 异常: {e}")
+
+    return None
+
+
 async def fetch_cookiecloud_cookie_str(host: str, uuid: str, password: str, timeout: int = 15) -> Optional[str]:
     """
-    拉取 CookieCloud 明文并构造 Cookie 字符串。
+    拉取 CookieCloud 数据并构造 Cookie 字符串。
+    优先使用 POST 明文；若仍返回 {encrypted} 或 POST 不可用，则回退到 GET(加密) + 本地解密。
     返回:
         cookies_str 或 None
     """
@@ -116,40 +211,83 @@ async def fetch_cookiecloud_cookie_str(host: str, uuid: str, password: str, time
         return None
 
     url = f"{host}/get/{uuid}"
-    params = {}
-    if password:
-        params["password"] = password
+    get_url = url  # GET 用于拉取 encrypted
 
     try:
         timeout_obj = aiohttp.ClientTimeout(total=timeout)
         async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-            async with session.get(url, params=params) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    logger.error(f"CookieCloud 请求失败: HTTP {resp.status}, 响应: {text[:200]}")
+            # 1) 优先 POST 明文（服务端要求：GET 不能用于解密）
+            if password:
+                post_data = await _post_try_plain(session, url, password)
+                if post_data is not None:
+                    cookie_data = _extract_cookie_data(post_data)
+                    if cookie_data:
+                        cookies_str = build_cookie_str_from_cookie_data(cookie_data)
+                        logger.info(f"CookieCloud 拉取成功（POST 明文），合并后 Cookie 长度: {len(cookies_str)}")
+                        return cookies_str
+                    # 如果 POST 返回了 encrypted，则继续走加密解密分支
+                    if isinstance(post_data, dict) and isinstance(post_data.get("encrypted"), str):
+                        logger.debug("CookieCloud POST 返回 encrypted，准备本地解密")
+                        data = post_data
+                    else:
+                        data = None
+                else:
+                    data = None
+            else:
+                data = None
+
+            # 2) 若 POST 不可用或未返回明文，则 GET 获取加密数据
+            if data is None:
+                async with session.get(get_url) as resp:
+                    text = await resp.text()
+                    if resp.status != 200:
+                        logger.error(f"CookieCloud GET 请求失败: HTTP {resp.status}, 响应: {text[:200]}")
+                        return None
+                    try:
+                        data = json.loads(text)
+                    except Exception:
+                        logger.error("CookieCloud GET 响应不是 JSON")
+                        return None
+
+            # 3) 处理加密分支（本地解密）
+            if isinstance(data, dict) and isinstance(data.get("encrypted"), str):
+                if not password:
+                    logger.warning("CookieCloud 返回 encrypted，但未提供密码，无法解密。")
                     return None
 
-                # 优先解析 JSON
+                # 计算 passphrase：md5(f"{uuid}-{password}")[:16]
+                passphrase = hashlib.md5(f"{uuid}-{password}".encode("utf-8")).hexdigest()[:16]
                 try:
-                    data = json.loads(text)
-                except Exception:
-                    logger.error("CookieCloud 响应不是 JSON")
-                    return None
+                    decrypted = _decrypt_cryptojs_encrypted(data["encrypted"], passphrase)
+                    decrypted_text = decrypted.decode("utf-8", errors="ignore")
+                    try:
+                        decrypted_obj = json.loads(decrypted_text)
+                    except Exception as e:
+                        logger.error(f"CookieCloud 解密后 JSON 解析失败: {e}")
+                        return None
 
-                # 明文返回（推荐）
-                cookie_data = _extract_cookie_data(data)
-                if cookie_data:
+                    cookie_data = _extract_cookie_data(decrypted_obj)
+                    if not cookie_data:
+                        logger.error(f"CookieCloud 解密后未找到 cookie_data 字段: {str(decrypted_obj)[:200]}")
+                        return None
+
                     cookies_str = build_cookie_str_from_cookie_data(cookie_data)
-                    logger.info(f"CookieCloud 拉取成功，合并后 Cookie 长度: {len(cookies_str)}")
+                    logger.info(f"CookieCloud 解密成功，合并后 Cookie 长度: {len(cookies_str)}")
                     return cookies_str
-
-                # 未能提取到 cookie_data，可能服务端未启用 password 解密
-                if isinstance(data, dict) and "encrypted" in data:
-                    logger.warning("CookieCloud 返回了加密字段 encrypted，但服务端未解密。请确保传入 password 或升级服务端。")
+                except Exception as e:
+                    logger.error(f"CookieCloud 本地解密失败: {e}")
                     return None
 
-                logger.error(f"CookieCloud 返回格式无法识别: {str(data)[:200]}")
-                return None
+            # 4) 明文但格式异常
+            cookie_data = _extract_cookie_data(data)
+            if cookie_data:
+                cookies_str = build_cookie_str_from_cookie_data(cookie_data)
+                logger.info(f"CookieCloud 拉取成功（明文），合并后 Cookie 长度: {len(cookies_str)}")
+                return cookies_str
+
+            logger.error(f"CookieCloud 返回格式无法识别: {str(data)[:200]}")
+            return None
+
     except asyncio.TimeoutError:
         logger.error("CookieCloud 请求超时")
         return None
