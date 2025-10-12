@@ -1,6 +1,11 @@
 # Goofish-Auto-reply-replace
 修改 https://github.com/zhinianboke/xianyu-auto-reply 的docker，使其支持 https://github.com/easychen/CookieCloud
 
+# 一键执行脚本
+```bash
+curl -s https://raw.githubusercontent.com/OnlineMo/Goofish-Auto-reply-replace/refs/heads/main/replace.sh | bash
+```
+
 # 修改内容
 # /update 与 /get/:uuid API 支持 - 后端方法与加解密实现
 
