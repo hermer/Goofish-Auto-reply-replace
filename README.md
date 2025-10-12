@@ -1,13 +1,13 @@
 # Goofish-Auto-reply-replace
-修改 https://github.com/zhinianboke/xianyu-auto-reply 的docker，使其支持 https://github.com/easychen/CookieCloud
+修改 https://github.com/zhinianboke/xianyu-auto-reply 的 docker ，使其支持 https://github.com/easychen/CookieCloud
 
 # CookieCloud 环境变量集成与一键替换
 
-本文档位于 replace/ 目录，用于说明如何将本项目改造成通过环境变量从 CookieCloud 拉取 Cookie，并按间隔自动刷新。
+本文档同时位于 replace/ 目录，用于说明如何将本项目改造成通过环境变量从 CookieCloud 拉取 Cookie，并按间隔自动刷新。
 
 ## 环境变量
 
-- COOKIE_CLOUD_HOST: CookieCloud 服务器地址，例如 https://cookie.xy213.cn 或 http://45.138.70.177:8088
+- COOKIE_CLOUD_HOST: CookieCloud 服务器地址，例如 https://cookiecloud.25wz.cn/ 或 http://45.138.70.177:8088 （若公共服务器无法使用，请参考 https://github.com/easychen/CookieCloud/blob/master/README_cn.md 并自建服务端）
 - COOKIE_CLOUD_UUID: 在 CookieCloud 中配置的 uuid
 - COOKIE_CLOUD_PASSWORD: 用于在服务端解密返回明文 cookie_data 的密码
 - COOKIE_CLOUD_REFRESH_SECONDS: 刷新间隔（秒），默认 1800。也支持变量 COOKIE_CLOUD_REFRESH_INTERVAL
@@ -23,7 +23,8 @@
 - utils/cookiecloud.py: 从 CookieCloud 拉取并将 cookie_data 合并为标准 Cookie 字符串
 - replace/filelist.txt: 列出需替换的目标相对路径（用于脚本自动拉取）
 
-## 一键替换（推荐）
+## 一键替换（推荐），
+### 在 xianyu-auto-reply 的根目录执行下面代码，然后再构建 Dockers
 
 Linux/macOS（或 Windows 的 Git Bash/WSL）：
 
@@ -76,12 +77,12 @@ utils/cookiecloud.py
 ## 变更摘要
 
 - Start.py: 新增 _setup_cookiecloud_before_start 与 _cookiecloud_refresh_loop 流程，读取环境变量并在启动前覆盖 + 后台刷新
-- utils/cookiecloud.py: 实现 fetch_cookiecloud_cookie_str(host, uuid, password, timeout=15)，优先请求 /get/:uuid?password=xxx 返回明文，解析 cookie_data 合并为标准 Cookie 字符串
+- utils/cookiecloud.py: 实现 fetch_cookiecloud_cookie_str(host, uuid, password, timeout=15)，优先Post请求 /get/:uuid 返回明文，解析 cookie_data 合并为标准 Cookie 字符串
 
 ## 注意事项
 
 - 若服务端未开启 password 解密，/get/:uuid 返回 encrypted 字段，脚本将记录警告并跳过更新
 - 若项目在 Windows 环境且没有 Bash，可直接使用 Python 脚本进行替换
-- 刷新间隔设置过短可能导致服务端限流，建议 ≥ 300 秒
+- 刷新间隔设置过短可能导致服务端限流，建议 ≥ 300 秒（最小60s，小于60s则自动设为60s）
 
 完成后，设置环境变量并正常启动项目即可生效。
