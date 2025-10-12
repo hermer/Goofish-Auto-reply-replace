@@ -27,7 +27,7 @@
 ### 在 xianyu-auto-reply 的根目录执行下面代码，然后再构建 Dockers
 
 Linux/macOS（或 Windows 的 Git Bash/WSL）：
-
+> *也可以连接docker的终端执行此代码*
 ```bash
 curl -fsSL https://raw.githubusercontent.com/OnlineMo/Goofish-Auto-reply-replace/refs/heads/main/replace.sh | bash
 ```
