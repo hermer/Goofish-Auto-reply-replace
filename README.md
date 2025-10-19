@@ -114,4 +114,7 @@ XianyuAutoAsync.py
 - 若项目在 Windows 环境且没有 Bash，可直接使用 Python 脚本进行替换。
 - 刷新间隔设置过短可能导致服务端限流，建议 ≥ 300 秒（最小60s，小于60s则自动设为60s）。
 
+## Stargazers over time
+[![Stargazers over time](https://starchart.cc/OnlineMo/Goofish-Auto-reply-replace.svg?variant=adaptive)]
+
 完成后，设置环境变量并正常启动项目即可生效。
