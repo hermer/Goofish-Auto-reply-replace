@@ -151,7 +151,8 @@ async def _setup_cookiecloud_before_start(manager: "cm.CookieManager"):
     password = (os.getenv("COOKIE_CLOUD_PASSWORD") or "").strip()
     refresh_seconds = os.getenv("COOKIE_CLOUD_REFRESH_SECONDS") or os.getenv("COOKIE_CLOUD_REFRESH_INTERVAL") or "1800"
     cookie_id_env = (os.getenv("COOKIE_CLOUD_COOKIE_ID") or "").strip()
-
+    refresh_on_token_failure_only = os.getenv("COOKIE_REFRESH_ON_TOKEN_FAILURE_ONLY", "true").lower() in ("true", "1", "t")
+ 
     # 未配置 CookieCloud，跳过
     if not host or not uuid:
         logger.info("未配置 CookieCloud 环境变量，沿用本地 Cookie")
@@ -195,10 +196,13 @@ async def _setup_cookiecloud_before_start(manager: "cm.CookieManager"):
     logger.info(f"CookieCloud 首次同步完成，已覆盖账号 {target_cookie_id} 的 Cookie，长度={len(cookies_str)}")
 
     # 启动后台刷新任务
-    if refresh_seconds > 0:
+    # 启动后台刷新任务
+    if refresh_seconds > 0 and not refresh_on_token_failure_only:
         asyncio.create_task(
             _cookiecloud_refresh_loop(manager, target_cookie_id, host, uuid, password, refresh_seconds)
         )
+    elif refresh_on_token_failure_only:
+        logger.info("已配置为仅在 Token 刷新失败时更新 Cookie，后台定时刷新已禁用")
 
 
 async def main():
