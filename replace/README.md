@@ -102,12 +102,6 @@ utils/cookiecloud.py
 XianyuAutoAsync.py
 ```
 
-## 变更摘要
-
-- `Start.py`: 新增 `_setup_cookiecloud_before_start` 与 `_cookiecloud_refresh_loop` 流程，读取环境变量并在启动前覆盖 + 后台刷新。
-- `XianyuAutoAsync.py`: 新增 Token 刷新失败后，根据环境变量强制刷新 Cookie 的兜底逻辑。
-- `utils/cookiecloud.py`: 实现 `fetch_cookiecloud_cookie_str(host, uuid, password, timeout=15)`，优先Post请求 `/get/:uuid` 返回明文，解析 `cookie_data` 合并为标准 Cookie 字符串。
-
 ## 注意事项
 
 - 若服务端未开启 password 解密，`/get/:uuid` 返回 encrypted 字段，脚本将记录警告并跳过更新。
@@ -115,3 +109,4 @@ XianyuAutoAsync.py
 - 刷新间隔设置过短可能导致服务端限流，建议 ≥ 300 秒（最小60s，小于60s则自动设为60s）。
 
 完成后，设置环境变量并正常启动项目即可生效。
+
