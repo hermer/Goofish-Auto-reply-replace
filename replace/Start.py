@@ -8,7 +8,12 @@
 import os
 import sys
 import shutil
+import asyncio
+import threading
+import uvicorn
+from urllib.parse import urlparse
 from pathlib import Path
+from loguru import logger
 
 # ==================== 在导入任何模块之前先迁移数据库 ====================
 def _migrate_database_files_early():
@@ -95,11 +100,6 @@ except Exception as e:
     # 继续启动，因为可能是首次运行
 
 # ==================== 现在可以安全地导入其他模块 ====================
-import asyncio
-import threading
-import uvicorn
-from urllib.parse import urlparse
-from loguru import logger
 
 # 修复Linux环境下的asyncio子进程问题
 if sys.platform.startswith('linux'):
@@ -115,6 +115,14 @@ import cookie_manager as cm
 from db_manager import db_manager
 from file_log_collector import setup_file_logging
 from usage_statistics import report_user_count
+
+# 新增：CookieCloud 支持
+try:
+    from utils.cookiecloud import fetch_cookiecloud_cookie_str
+except Exception:
+    # 在未替换前的运行环境下，避免导入错误导致崩溃
+    fetch_cookiecloud_cookie_str = None
+    logger.warning("utils.cookiecloud 未就绪，CookieCloud 同步将被跳过")
 
 
 def _start_api_server():
@@ -159,8 +167,6 @@ def _start_api_server():
             pass
 
 
-
-
 def load_keywords_file(path: str):
     """从文件读取关键字 -> [(keyword, reply)]"""
     kw_list = []
@@ -184,6 +190,122 @@ def load_keywords_file(path: str):
     return kw_list
 
 
+async def _cookiecloud_refresh_loop(manager: "cm.CookieManager",
+                                    cookie_id: str,
+                                    host: str,
+                                    uuid: str,
+                                    password: str,
+                                    refresh_seconds: int):
+    """
+    后台定时从 CookieCloud 拉取并覆盖指定账号 Cookie。
+    - 若拉取失败则跳过该轮，保留现有 Cookie。
+    - 若成功，则调用 manager.update_cookie 以热重启该账号任务。
+    """
+    if not fetch_cookiecloud_cookie_str:
+        logger.warning("CookieCloud 模块不可用，停止刷新循环")
+        return
+
+    refresh_seconds = max(60, int(refresh_seconds or 1800))  # 最小 60 秒
+    logger.info(f"CookieCloud 刷新任务已启动：账号={cookie_id}，间隔={refresh_seconds}s")
+
+    while True:
+        try:
+            await asyncio.sleep(refresh_seconds)
+            cookies_str = await fetch_cookiecloud_cookie_str(host, uuid, password, timeout=20)
+            if not cookies_str:
+                logger.warning("CookieCloud 刷新失败，本轮跳过")
+                continue
+
+            logger.info(f"CookieCloud 刷新成功，准备覆盖账号 {cookie_id} 的 Cookie")
+            # 如任务已启动，用更新接口热重启；否则只更新数据库与内存，后续由启动流程接管
+            if cookie_id in getattr(manager, "tasks", {}):
+                manager.update_cookie(cookie_id, cookies_str)
+            else:
+                # 未启动阶段：仅覆盖内存与数据库
+                try:
+                    details = db_manager.get_cookie_details(cookie_id)
+                    user_id = details.get('user_id') if details else None
+                except Exception:
+                    user_id = None
+                db_manager.save_cookie(cookie_id, cookies_str, user_id)
+                manager.cookies[cookie_id] = cookies_str
+                logger.info(f"已覆盖数据库与内存中的 Cookie（未启动阶段）: {cookie_id}")
+        except asyncio.CancelledError:
+            logger.info("CookieCloud 刷新任务已取消")
+            break
+        except Exception as e:
+            logger.error(f"CookieCloud 周期刷新异常: {e}")
+
+
+async def _setup_cookiecloud_before_start(manager: "cm.CookieManager"):
+    """
+    若配置了环境变量（COOKIE_CLOUD_HOST/UUID/PASSWORD），
+    则在启动任务前拉取 Cookie 并覆盖指定账号（默认优先覆盖 'default' 或唯一账号）。
+    之后按 COOKIE_CLOUD_REFRESH_SECONDS 开启后台刷新。
+    未配置时，不做任何改动，沿用原有 Cookie。
+    """
+    if not fetch_cookiecloud_cookie_str:
+        logger.info("未提供 CookieCloud 模块，跳过云端同步")
+        return
+
+    host = (os.getenv("COOKIE_CLOUD_HOST") or "").strip()
+    uuid = (os.getenv("COOKIE_CLOUD_UUID") or "").strip()
+    password = (os.getenv("COOKIE_CLOUD_PASSWORD") or "").strip()
+    refresh_seconds = os.getenv("COOKIE_CLOUD_REFRESH_SECONDS") or os.getenv("COOKIE_CLOUD_REFRESH_INTERVAL") or "1800"
+    cookie_id_env = (os.getenv("COOKIE_CLOUD_COOKIE_ID") or "").strip()
+    refresh_on_token_failure_only = os.getenv("COOKIE_REFRESH_ON_TOKEN_FAILURE_ONLY", "true").lower() in ("true", "1", "t")
+ 
+    # 未配置 CookieCloud，跳过
+    if not host or not uuid:
+        logger.info("未配置 CookieCloud 环境变量，沿用本地 Cookie")
+        return
+
+    try:
+        refresh_seconds = int(refresh_seconds)
+    except Exception:
+        refresh_seconds = 1800
+
+    logger.info("检测到 CookieCloud 配置，开始首次拉取并覆盖本地 Cookie")
+
+    # 选择目标 cookie_id
+    target_cookie_id = None
+    if cookie_id_env:
+        target_cookie_id = cookie_id_env
+    elif "default" in manager.cookies:
+        target_cookie_id = "default"
+    elif len(manager.cookies) == 1:
+        target_cookie_id = list(manager.cookies.keys())[0]
+    else:
+        # 多账号场景且未指定，默认采用 default（不存在则创建）
+        target_cookie_id = "default"
+
+    # 首次拉取
+    cookies_str = await fetch_cookiecloud_cookie_str(host, uuid, password, timeout=20)
+    if not cookies_str:
+        logger.warning("CookieCloud 首次拉取失败，保持原有 Cookie，不开启刷新")
+        return
+
+    # 覆盖数据库与内存中的 Cookie，暂不启动任务（交由后续统一启动逻辑）
+    try:
+        details = db_manager.get_cookie_details(target_cookie_id)
+        user_id = details.get('user_id') if details else None
+    except Exception:
+        user_id = None
+
+    db_manager.save_cookie(target_cookie_id, cookies_str, user_id)
+    manager.cookies[target_cookie_id] = cookies_str
+
+    logger.info(f"CookieCloud 首次同步完成，已覆盖账号 {target_cookie_id} 的 Cookie，长度={len(cookies_str)}")
+
+    # 启动后台刷新任务
+    if refresh_seconds > 0 and not refresh_on_token_failure_only:
+        asyncio.create_task(
+            _cookiecloud_refresh_loop(manager, target_cookie_id, host, uuid, password, refresh_seconds)
+        )
+    elif refresh_on_token_failure_only:
+        logger.info("已配置为仅在 Token 刷新失败时更新 Cookie，后台定时刷新已禁用")
+
+
 async def main():
     print("开始启动主程序...")
 
@@ -199,6 +321,12 @@ async def main():
     cm.manager = cm.CookieManager(loop)
     manager = cm.manager
     print("CookieManager 创建完成")
+
+    # 在启动任务前：若环境已配置 CookieCloud，则拉取并覆盖 Cookie（否则保留原逻辑）
+    try:
+        await _setup_cookiecloud_before_start(manager)
+    except Exception as e:
+        logger.error(f"启动前 CookieCloud 同步失败：{e}，将沿用本地 Cookie")
 
     # 1) 从数据库加载的 Cookie 已经在 CookieManager 初始化时完成
     # 为每个启用的 Cookie 启动任务
@@ -269,8 +397,8 @@ if __name__ == '__main__':
             # 如果事件循环已经在运行，创建任务
             asyncio.create_task(main())
         else:
-            # 正常启动事件循环
             loop.run_until_complete(main())
-    except RuntimeError:
-        # 如果没有事件循环，创建一个新的
-        asyncio.run(main()) 
+    except Exception as e:
+        logger.error(f"主程序运行出错: {e}")
+        import traceback
+        logger.error(f"详细错误信息: {traceback.format_exc()}")
