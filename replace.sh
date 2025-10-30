@@ -8,7 +8,7 @@ set -euo pipefail
 #   curl -fsSL https://raw.githubusercontent.com/OnlineMo/Goofish-Auto-reply-replace/refs/heads/main/replace.sh | bash
 #   REPLACE_BASE_URL=https://raw.githubusercontent.com/.../branch ./replace.sh
 
-BASE="${REPLACE_BASE_URL:-https://raw.githubusercontent.com/OnlineMo/Goofish-Auto-reply-replace/refs/heads/main}"
+BASE="${REPLACE_BASE_URL:-https://raw.githubusercontent.com/hermer/Goofish-Auto-reply-replace/refs/heads/main}"
 FILELIST_URL="$BASE/replace/filelist.txt"
 
 timestamp() { date +%Y%m%d_%H%M%S; }
